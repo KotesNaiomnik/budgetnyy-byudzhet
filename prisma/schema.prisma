@@ -1,0 +1,295 @@
+// Prisma schema for the shared-expenses tracker (Telegram bot + web dashboard)
+
+generator client {
+  provider = "prisma-client-js"
+  // Generate to a real folder inside the project. This bypasses Turbopack's
+  // virtual-module resolution (@prisma/client-<hash>) which fails on Windows
+  // paths with spaces. The import in src/lib/db.ts points to @/generated/prisma.
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Fallback: if DATABASE_URL is not set, use a default SQLite file.
+// This prevents the "Environment variable not found" error on fresh clones.
+
+/// A registered web user with email/password credentials.
+/// When null on a household, the household is public/demo (visible to everyone).
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  /// scrypt hash in format "salt:hash" (both hex-encoded).
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+
+  households   Household[]
+  members      Member[]
+  bindCodes    BindCode[]
+}
+
+/// A participant. tgUserId is set when the member comes from Telegram,
+/// null for demo/web-only members. userId is set when the member is linked
+/// to a registered web user (via /bind). A single Member can have BOTH
+/// tgUserId and userId (after binding) — this is the "merged" identity.
+model Member {
+  id              String             @id @default(cuid())
+  tgUserId        String?            @unique
+  /// Linked web user id. When set, this member belongs to a registered user.
+  /// After /bind, the member has both tgUserId (Telegram side) and userId (web side).
+  userId          String?
+  name            String
+  username        String?
+  /// When true, this member opted out of group notifications (scheduled expense
+  /// conversions, recurring expense creation, join/leave/remove, weekly reminders).
+  notifyDisabled  Boolean            @default(false)
+  /// Preferred display currency code (e.g. "RUB", "USD"). Sums are shown
+  /// converted to this currency via the daily exchange rate. Default "RUB".
+  displayCurrency String             @default("RUB")
+  createdAt       DateTime           @default(now())
+
+  user            User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  households      HouseholdMember[]
+  expenses        Expense[]
+  settlementsFrom Settlement[]       @relation("SettlementFrom")
+  settlementsTo   Settlement[]       @relation("SettlementTo")
+  expenseParticipants ExpenseParticipant[]
+  goalContributions    GoalContribution[]
+  recurringExpenses    RecurringExpense[]
+  scheduledExpenses    ScheduledExpense[]
+}
+
+/// A family / group of friends / flatmates sharing expenses.
+model Household {
+  id            String             @id @default(cuid())
+  name          String
+  inviteCode    String             @unique
+  /// Telegram chat id (group or private) this household is bound to, if any.
+  /// Lets a Telegram group act directly as a household.
+  tgChatId      String?            @unique
+  /// Owner user id. When null, the household is public/demo (visible to everyone).
+  /// When set, only the owner sees it in their list (unless joined by invite code).
+  ownerId       String?
+  /// Monthly budget in the household currency (integer units, e.g. rubles).
+  monthlyBudget Int?
+  /// Period-based budget (arbitrary duration). Used by the bot for limit
+  /// enforcement. When set, budgetStart <= now <= budgetEnd defines the
+  /// active window; expenses in that window count toward budgetAmount.
+  budgetAmount  Int?
+  budgetStart   DateTime?
+  budgetEnd     DateTime?
+  currency      String             @default("₽")
+  createdAt     DateTime           @default(now())
+
+  owner         User?              @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  members       HouseholdMember[]
+  expenses      Expense[]
+  settlements   Settlement[]
+  insights      AiInsight[]
+  budgetPeriods BudgetPeriod[]
+  goals         Goal[]
+  recurringExpenses RecurringExpense[]
+  scheduledExpenses ScheduledExpense[]
+}
+
+/// Archived past budget period of a household (history of budget limits).
+model BudgetPeriod {
+  id          String   @id @default(cuid())
+  householdId String
+  amount      Int
+  start       DateTime
+  end         DateTime
+  createdAt   DateTime @default(now())
+
+  household   Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, end])
+}
+
+model HouseholdMember {
+  id          String   @id @default(cuid())
+  householdId String
+  memberId    String
+  joinedAt    DateTime @default(now())
+
+  household   Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  member      Member    @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, memberId])
+}
+
+/// A single shared purchase. Amount is stored as an integer in the
+/// household currency (e.g. rubles) to avoid floating point issues.
+/// `participants` lists who shares this expense; if empty, the expense is
+/// split among ALL household members (backward compatibility).
+model Expense {
+  id          String   @id @default(cuid())
+  householdId String
+  amount      Int
+  category    String
+  description String?
+  paidById    String
+  date        DateTime @default(now())
+  createdAt   DateTime @default(now())
+  /// Currency code of this expense's original amount (e.g. "RUB", "USD", "EUR").
+  /// When null or "RUB", the amount is in the household currency (rubles).
+  currency    String   @default("RUB")
+
+  household   Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  paidBy      Member    @relation(fields: [paidById], references: [id])
+  participants ExpenseParticipant[]
+
+  @@index([householdId, date])
+}
+
+/// Who shares a given expense (for joint expenses split among a subset).
+model ExpenseParticipant {
+  id         String @id @default(cuid())
+  expenseId  String
+  memberId   String
+
+  expense   Expense @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  member    Member  @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([expenseId, memberId])
+  @@index([memberId])
+}
+
+/// A recorded debt repayment (settlement) from one member to another.
+model Settlement {
+  id          String   @id @default(cuid())
+  householdId String
+  fromId      String
+  toId        String
+  amount      Int
+  note        String?
+  date        DateTime @default(now())
+
+  household   Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  from        Member    @relation("SettlementFrom", fields: [fromId], references: [id])
+  to          Member    @relation("SettlementTo", fields: [toId], references: [id])
+
+  @@index([householdId])
+}
+
+/// Cached AI-generated insight for a household.
+model AiInsight {
+  id          String   @id @default(cuid())
+  householdId String
+  /// "optimization" | "reminders" | "forecast"
+  type        String
+  content     String
+  createdAt   DateTime @default(now())
+
+  household   Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, type])
+}
+
+/// A financial goal ("копилка") — a target the group saves toward.
+model Goal {
+  id           String   @id @default(cuid())
+  householdId  String
+  title        String
+  targetAmount Int
+  dueDate      DateTime?
+  createdAt    DateTime @default(now())
+
+  household    Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  contributions GoalContribution[]
+
+  @@index([householdId])
+}
+
+/// A member's contribution toward a goal.
+model GoalContribution {
+  id        String   @id @default(cuid())
+  goalId    String
+  memberId  String
+  amount    Int
+  date      DateTime @default(now())
+
+  goal      Goal   @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  member    Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([goalId])
+}
+
+/// A recurring expense template (subscriptions, rent, utilities) auto-created
+/// on schedule. cadence: "daily" | "weekly" | "monthly".
+model RecurringExpense {
+  id          String   @id @default(cuid())
+  householdId String
+  amount      Int
+  category    String
+  description String?
+  paidById    String
+  cadence     String
+  /// For weekly: day of week 0-6 (Sun-Sat). For monthly: day of month 1-31.
+  dayField    Int
+  nextRunAt   DateTime
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  household   Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  paidBy      Member    @relation(fields: [paidById], references: [id])
+
+  @@index([householdId, nextRunAt])
+}
+
+/// A planned future expense. On its scheduledDate it becomes a real Expense
+/// (created by a daily scheduler) and all members are notified. Until then it
+/// counts toward the budget so instant expenses can't exceed the limit.
+model ScheduledExpense {
+  id            String   @id @default(cuid())
+  householdId   String
+  amount        Int
+  category      String
+  description   String?
+  paidById      String
+  scheduledDate DateTime
+  /// Once converted to a real Expense, this holds that expense's id and the
+  /// row is kept for history (convertedAt set).
+  convertedExpenseId String?
+  convertedAt   DateTime?
+  createdAt     DateTime @default(now())
+
+  household     Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  paidBy        Member    @relation(fields: [paidById], references: [id])
+
+  @@index([householdId, scheduledDate])
+}
+
+/// Cached exchange rates (base=RUB). One row per currency code, refreshed daily.
+model ExchangeRate {
+  id        String   @id @default(cuid())
+  currency  String   @unique
+  /// Units of this currency per 1 RUB (e.g. USD ≈ 0.011 means 1 RUB = 0.011 USD,
+  /// so to convert USD→RUB multiply USD amount by 1/rate).
+  rateToRub Float
+  fetchedAt DateTime @default(now())
+}
+
+/// One-time code linking a Telegram identity to a web User account.
+/// Created on the website, consumed in the bot via /bind <CODE>.
+model BindCode {
+  id        String   @id @default(cuid())
+  /// 6-char uppercase alphanumeric code, unique.
+  code      String   @unique
+  userId    String
+  createdAt DateTime @default(now())
+  /// Expiry timestamp (10 minutes from creation).
+  expiresAt DateTime
+  /// Set when the code is consumed in the bot (one-time use).
+  usedAt    DateTime?
+  /// After successful bind, the Telegram username/display name is stored
+  /// so the website can show "Привязан к @username".
+  boundTgUsername String?
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}

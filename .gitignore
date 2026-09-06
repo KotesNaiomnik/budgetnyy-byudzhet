@@ -1,0 +1,69 @@
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+local-*
+# .z-ai-config — включён в репозиторий для работы AI на других ПК
+*.log
+dev.log
+dev.out.log
+test
+prompt
+
+server.log
+
+# Skills directory
+/skills/
+
+# Bot service
+/mini-services/
+
+# Examples & downloads
+/examples/
+/download/
+/tests/
+/tool-results/
+
+# Database
+/db/
+*.db
+*.db-journal
+
+# Prisma generated client (real folder, not virtual module)
+src/generated/
+mini-services/*/src/generated/
